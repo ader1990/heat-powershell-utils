@@ -18,13 +18,58 @@ $rebotCode = 1001
 $reexecuteCode = 1002
 $rebootAndReexecuteCode = 1003
 
-
-function Log {
+function Log-HeatMessage {
     param(
-        $message
-        )
+        [string]$Message
+    )
 
-    Write-Host $message
+    Write-Host $Message
+}
+
+function ExitFrom-Script {
+    param(
+        [int]$ExitCode
+    )
+
+    exit $ExitCode
+}
+
+function ExecuteWith-Retry {
+    param(
+        [ScriptBlock]$Command,
+        [int]$MaxRetryCount=10,
+        [int]$RetryInterval=3,
+        [array]$Arguments=@()
+    )
+
+    $currentErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+
+    $retryCount = 0
+    while ($true) {
+        try {
+            $res = Invoke-Command -ScriptBlock $Command `
+                     -ArgumentList $Arguments
+            $ErrorActionPreference = $currentErrorActionPreference
+            return $res
+        } catch [System.Exception] {
+            $retryCount++
+            if ($retryCount -gt $MaxRetryCount) {
+                $ErrorActionPreference = $currentErrorActionPreference
+                throw $_.Exception
+            } else {
+                Write-Error $_.Exception
+                Start-Sleep $RetryInterval
+            }
+        }
+    }
+}
+
+function Execute-Command ($Command, $Arguments, $ErrorMessage) {
+    Invoke-Command -ScriptBlock $Command -ArgumentList $Arguments
+    if ($LASTEXITCODE -ne 0) {
+        throw $ErrorMessage
+    }
 }
 
 function Is-FeatureAvailable {
@@ -32,103 +77,177 @@ function Is-FeatureAvailable {
         [Parameter(Mandatory=$true)]
         [string]$FeatureName
     )
+
     $featureInstallState = (Get-WindowsFeature -Name $FeatureName).InstallState
     $isAvailable = ($featureInstallState -eq "Available") -or `
-                     ($featureInstallState -eq "Removed")
+                   ($featureInstallState -eq "Removed")
 
     return $isAvailable
 }
 
-function Is-FeatureInstalled {
-    param(
-        [Parameter(Mandatory=$true)]
-        [string]$FeatureName
-    )
-
-    $installState = (Get-WindowsFeature -Name $FeatureName).InstallState
-
-    $isInstalled = ($installState -eq "Installed") `
-                 -or ($installState -eq "InstallPending" )
-
-    return $isInstalled
-}
 function Install-WindowsFeatures {
      param(
         [Parameter(Mandatory=$true)]
-        [array]$Features
+        [array]$Features,
+        [int]$RebootCode=$rebootAndReexecuteCode
     )
+
+    $winVer = (Get-WmiObject -class Win32_OperatingSystem).Version.Split('.')
+    $isWinServer2008R2 = (($winVer[0] -eq 6) -and ($winVer[1] -eq 1))
+    if ($isWinServer2008R2 -eq $true) {
+        Import-Module ServerManager
+    }
 
     $installedFeatures = 0
     $rebootNeeded = $false
     foreach ($feature in $Features) {
         $isAvailable = Is-FeatureAvailable $feature
         if ($isAvailable -eq $true) {
-            $res = Install-WindowsFeature -Name $feature
-            if ($res.RestartNeeded -eq 'Yes') {
+            if ($isWinServer2008R2 -eq $true) {
+                ExecuteWith-Retry -Command {
+                    $state = Add-WindowsFeature -Name $feature
+                }
+            } else {
+                ExecuteWith-Retry -Command {
+                    $state = Install-WindowsFeature -Name $feature
+                }
+            }
+        }
+        if ($state.Success -eq $true) {
+            $installedFeatures = $installedFeatures + 1
+            if ($state.RestartNeeded -eq 'Yes') {
                 $rebootNeeded = $true
             }
-        }
-        $isInstalled = Is-FeatureInstalled $feature
-        if ($isInstalled -eq $true) {
-            $installedFeatures = $installedFeatures + 1
         } else {
-            Log "Install failed for feature $feature"
+            Log-HeatMessage "Install failed for feature $feature"
         }
     }
 
-    return @{"InstalledFeatures" = $installedFeatures;
-             "Reboot" = $rebootNeeded }
+    if ($installedFeatures -lt $Features.Count) {
+        throw "Error occurred while installing some features."
+    }
+
+    if ($rebootNeeded -eq $true) {
+        exit $RebootCode
+    }
 }
 
-function ExitFrom-Script {
+function CopyFrom-SambaShare {
     param(
-        [int]$ExitCode
+        [Parameter(Mandatory=$true)]
+        [string]$SambaDrive,
+        [Parameter(Mandatory=$true)]
+        [string]$SambaShare,
+        [Parameter(Mandatory=$true)]
+        [string]$SambaFolder,
+        [Parameter(Mandatory=$true)]
+        [string]$FileName,
+        [Parameter(Mandatory=$true)]
+        [string]$Destination
     )
-    exit $ExitCode
+
+    New-PSDrive -Name $SambaDrive -Root $SambaShare -PSProvider FileSystem
+    $samba = ($SambaDrive + ":\\" + $SambaFolder)
+    if (!(Test-Path "$Destination\$FileName")) {
+        Copy-Item "$samba\$FileName" $Destination -Recurse
+    }
 }
 
-function ExecuteWith-RetryPSCommand {
+function Unzip-File ($ZipFile, $Destination) {
+    $shellApp = New-Object -ComObject Shell.Application
+    $zipFileNs = $shellApp.NameSpace($ZipFile)
+    $destinationNs = $shellApp.NameSpace($Destination)
+    $destinationNs.CopyHere($zipFileNs.Items(), 0x4)
+}
+
+function Download-File ($DownloadLink, $DestinationFile) {
+    $webclient = New-Object System.Net.WebClient
+    ExecuteWith-Retry -Command {
+        $webclient.DownloadFile($DownloadLink, $DestinationFile)
+    }
+}
+
+# Get-FileHash for Powershell versions less than 4.0 (SHA1 algorithm only)
+function Get-FileSHA1Hash {
+    [CmdletBinding()]
     param(
-        [ScriptBlock]$Command,
-        [int]$MaxRetryCount=3,
-        [int]$RetryInterval=0,
-        [array]$ArgumentList=@()
+        [parameter(Mandatory=$true)]
+        [string]$Path,
+        [string]$Algorithm = "SHA1"
     )
 
-    $currentErrorActionPreference = $ErrorActionPreference
-    $ErrorActionPreference = "Continue"
-    $retryCount = 0
-
-    while ($true) {
+    process
+    {
+        if ($Algorithm -ne "SHA1") {
+            throw "Unsupported algorithm: $Algorithm"
+        }
+        $fullPath = Resolve-Path $Path
+        $f = [System.IO.File]::OpenRead($fullPath)
+        $sham = $null
         try {
-            $res = Invoke-Command -ScriptBlock $Command `
-                     -ArgumentList $ArgumentList
-            return $res
-        } catch [System.Exception] {
-            if ($retryCount -ge $MaxRetryCount) {
-                $ErrorActionPreference = $currentErrorActionPreference
-                throw $_.Exception
-            } else {
-                Start-Sleep $RetryInterval
+            $sham = New-Object System.Security.Cryptography.SHA1Managed
+            $hash = $sham.ComputeHash($f)
+            $hashSB = New-Object System.Text.StringBuilder `
+                                -ArgumentList ($hash.Length * 2)
+            foreach ($b in $hash) {
+                $sb = $hashSB.AppendFormat("{0:x2}", $b)
             }
-            $retryCount++
+            return [PSCustomObject]@{Algorithm="SHA1";
+                                     Hash=$hashSB.ToString().ToUpper();
+                                     Path=$fullPath}
+        }
+        finally {
+            $f.Close()
+            if($sham) {
+                $sham.Clear()
+            }
         }
     }
-
-    $ErrorActionPreference = $currentErrorActionPreference
 }
 
-function Copy-FilesLocal {
-    param()
-    New-PSDrive -Name $smbDrive -Root $smbShare -PSProvider FileSystem
-    if (!(Test-Path "$copyLocal\$isoName")){
-        Copy-Item "$temp\$isoName" $copyLocal
+function Check-FileIntegrityWithSHA1 ($File, $ExpectedSHA1Hash) {
+    if ($PSVersionTable.PSVersion.Major -lt 4) {
+        $hash = (Get-FileSHA1Hash -Path $File).Hash
+    } else {
+        $hash = (Get-FileHash -Path $File -Algorithm "SHA1").Hash
     }
+    if ($hash -ne $ExpectedSHA1Hash) {
+        throw ("SHA1 hash not valid for file: $filename. " +
+               "Expected: $ExpectedSHA1Hash Current: $hash")
+    }
+}
+
+function Install-Program {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$DownloadLink,
+        [Parameter(Mandatory=$true)]
+        [string]$DestinationFile,
+        [Parameter(Mandatory=$true)]
+        [string]$ExpectedSHA1Hash,
+        [Parameter(Mandatory=$true)]
+        [string]$Arguments,
+        [Parameter(Mandatory=$true)]
+        [string]$ErrorMessage
+)
+
+    Download-File $DownloadLink $DestinationFile
+    Check-FileIntegrityWithSHA1 $DestinationFile $ExpectedSHA1Hash
+
+    $p = Start-Process -FilePath $DestinationFile `
+                       -ArgumentList $Arguments `
+                       -PassThru `
+                       -Wait
+    if ($p.ExitCode -ne 0) {
+        throw $ErrorMessage
+    }
+
+    Remove-Item $DestinationFile
 }
 
 try {
-    Export-ModuleMember -Function * -ErrorAction SilentlyContinue
+    Export-ModuleMember -Function *
 } catch {
-    Log "Outside of the module. This file has been dot sourced or included as text."
+    Log-HeatMessage ("Outside of the module. This file has been " +
+                     "dot sourced or included as text.")
 }
-
