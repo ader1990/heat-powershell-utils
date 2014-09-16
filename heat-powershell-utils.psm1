@@ -65,24 +65,18 @@ function ExecuteWith-Retry {
     }
 }
 
-function Execute-Command ($Command, $Arguments, $ErrorMessage) {
-    Invoke-Command -ScriptBlock $Command -ArgumentList $Arguments
+function Execute-Command {
+    param(
+        [ScriptBlock]$Command,
+        [array]$Arguments=@(),
+        [string]$ErrorMessage
+    )
+
+    $res = Invoke-Command -ScriptBlock $Command -ArgumentList $Arguments
     if ($LASTEXITCODE -ne 0) {
         throw $ErrorMessage
     }
-}
-
-function Is-FeatureAvailable {
-    param(
-        [Parameter(Mandatory=$true)]
-        [string]$FeatureName
-    )
-
-    $featureInstallState = (Get-WindowsFeature -Name $FeatureName).InstallState
-    $isAvailable = ($featureInstallState -eq "Available") -or `
-                   ($featureInstallState -eq "Removed")
-
-    return $isAvailable
+    return $res
 }
 
 function Install-WindowsFeatures {
@@ -98,37 +92,28 @@ function Install-WindowsFeatures {
         Import-Module ServerManager
     }
 
-    $installedFeatures = 0
     $rebootNeeded = $false
     foreach ($feature in $Features) {
-        $isAvailable = Is-FeatureAvailable $feature
-        if ($isAvailable -eq $true) {
-            if ($isWinServer2008R2 -eq $true) {
-                ExecuteWith-Retry -Command {
-                    $state = Add-WindowsFeature -Name $feature
-                }
-            } else {
-                ExecuteWith-Retry -Command {
-                    $state = Install-WindowsFeature -Name $feature
-                }
+        if ($isWinServer2008R2 -eq $true) {
+            $state = ExecuteWith-Retry -Command {
+                Add-WindowsFeature -Name $feature -ErrorAction Stop
+            }
+        } else {
+            $state = ExecuteWith-Retry -Command {
+                Install-WindowsFeature -Name $feature -ErrorAction Stop
             }
         }
         if ($state.Success -eq $true) {
-            $installedFeatures = $installedFeatures + 1
             if ($state.RestartNeeded -eq 'Yes') {
                 $rebootNeeded = $true
             }
         } else {
-            Log-HeatMessage "Install failed for feature $feature"
+            throw "Install failed for feature $feature"
         }
     }
 
-    if ($installedFeatures -lt $Features.Count) {
-        throw "Error occurred while installing some features."
-    }
-
     if ($rebootNeeded -eq $true) {
-        exit $RebootCode
+        ExitFrom-Script $RebootCode
     }
 }
 
@@ -153,14 +138,28 @@ function CopyFrom-SambaShare {
     }
 }
 
-function Unzip-File ($ZipFile, $Destination) {
+function Unzip-File {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$ZipFile,
+        [Parameter(Mandatory=$true)]
+        [string]$Destination
+    )
+
     $shellApp = New-Object -ComObject Shell.Application
     $zipFileNs = $shellApp.NameSpace($ZipFile)
     $destinationNs = $shellApp.NameSpace($Destination)
     $destinationNs.CopyHere($zipFileNs.Items(), 0x4)
 }
 
-function Download-File ($DownloadLink, $DestinationFile) {
+function Download-File {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$DownloadLink,
+        [Parameter(Mandatory=$true)]
+        [string]$DestinationFile
+    )
+
     $webclient = New-Object System.Net.WebClient
     ExecuteWith-Retry -Command {
         $webclient.DownloadFile($DownloadLink, $DestinationFile)
@@ -192,9 +191,9 @@ function Get-FileSHA1Hash {
             foreach ($b in $hash) {
                 $sb = $hashSB.AppendFormat("{0:x2}", $b)
             }
-            return [PSCustomObject]@{Algorithm="SHA1";
-                                     Hash=$hashSB.ToString().ToUpper();
-                                     Path=$fullPath}
+            return [PSCustomObject]@{ Algorithm="SHA1";
+                                      Hash=$hashSB.ToString().ToUpper();
+                                      Path=$fullPath }
         }
         finally {
             $f.Close()
@@ -205,7 +204,14 @@ function Get-FileSHA1Hash {
     }
 }
 
-function Check-FileIntegrityWithSHA1 ($File, $ExpectedSHA1Hash) {
+function Check-FileIntegrityWithSHA1 {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$File,
+        [Parameter(Mandatory=$true)]
+        [string]$ExpectedSHA1Hash
+    )
+
     if ($PSVersionTable.PSVersion.Major -lt 4) {
         $hash = (Get-FileSHA1Hash -Path $File).Hash
     } else {
@@ -229,7 +235,7 @@ function Install-Program {
         [string]$Arguments,
         [Parameter(Mandatory=$true)]
         [string]$ErrorMessage
-)
+    )
 
     Download-File $DownloadLink $DestinationFile
     Check-FileIntegrityWithSHA1 $DestinationFile $ExpectedSHA1Hash
@@ -245,9 +251,58 @@ function Install-Program {
     Remove-Item $DestinationFile
 }
 
-try {
-    Export-ModuleMember -Function *
-} catch {
-    Log-HeatMessage ("Outside of the module. This file has been " +
-                     "dot sourced or included as text.")
+function Set-IniFileValue {
+    [CmdletBinding()]
+    param(
+        [parameter(Mandatory=$true, ValueFromPipeline=$true)]
+        [string]$Key,
+        [parameter()]
+        [string]$Section = "DEFAULT",
+        [parameter(Mandatory=$true)]
+        [string]$Value,
+        [parameter(Mandatory=$true)]
+        [string]$Path
+    )
+
+    process
+    {
+        $Source = @"
+        using System;
+        using System.Text;
+        using System.Runtime.InteropServices;
+
+        namespace PSCloudbase
+        {
+            public sealed class Win32IniApi
+            {
+                [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+                public static extern uint GetPrivateProfileString(
+                   string lpAppName,
+                   string lpKeyName,
+                   string lpDefault,
+                   StringBuilder lpReturnedString,
+                   uint nSize,
+                   string lpFileName);
+
+                [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+                [return: MarshalAs(UnmanagedType.Bool)]
+                public static extern bool WritePrivateProfileString(
+                   string lpAppName,
+                   string lpKeyName,
+                   StringBuilder lpString, // Don't use string, as Powershell replaces $null with an empty string
+                   string lpFileName);
+
+                [DllImport("Kernel32.dll")]
+                public static extern uint GetLastError();
+            }
+        }
+"@
+        Add-Type -TypeDefinition $Source -Language CSharp
+        $retVal = [PSCloudbase.Win32IniApi]::WritePrivateProfileString($Section, $Key, $Value, $Path)
+        if (!$retVal -and [PSCloudbase.Win32IniApi]::GetLastError()) {
+            throw "Cannot set value in ini file: " + [PSCloudbase.Win32IniApi]::GetLastError()
+        }
+    }
 }
+
+Export-ModuleMember -Function *
