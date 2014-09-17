@@ -131,11 +131,14 @@ function CopyFrom-SambaShare {
         [string]$Destination
     )
 
-    New-PSDrive -Name $SambaDrive -Root $SambaShare -PSProvider FileSystem
+    $p = New-PSDrive -Name $SambaDrive -Root $SambaShare -PSProvider FileSystem
     $samba = ($SambaDrive + ":\\" + $SambaFolder)
-    if (!(Test-Path "$Destination\$FileName")) {
+    $localPath = "$Destination\$FileName"
+    if (!(Test-Path $localPath)) {
         Copy-Item "$samba\$FileName" $Destination -Recurse
     }
+    return $localPath
+
 }
 
 function Unzip-File {
@@ -303,6 +306,23 @@ function Set-IniFileValue {
             throw "Cannot set value in ini file: " + [PSCloudbase.Win32IniApi]::GetLastError()
         }
     }
+}
+
+function LogTo-File {
+    param(
+        $LogMessage,
+        $LogFile="C:\cfn\userdata.log",
+        $Topic="general"
+    )
+
+    $date = Get-Date
+    $fullMessage = "$Date | $Topic | $LogMessage"
+    Add-Content -Path $logFile -Value $fullMessage
+}
+
+function Open-Port($port, $protocol, $name) {
+    netsh.exe advfirewall firewall add rule name=$name dir=in action=allow `
+        protocol=$protocol localport=$port
 }
 
 Export-ModuleMember -Function *
