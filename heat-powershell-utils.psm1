@@ -325,4 +325,45 @@ function Open-Port($port, $protocol, $name) {
         protocol=$protocol localport=$port
 }
 
+function Add-WindowsUser {
+    param(
+        [parameter(Mandatory=$true)]
+        [string]$Username,
+        [parameter(Mandatory=$true)]
+        [string]$Password
+    )
+
+    NET.EXE USER $Username $Password '/ADD'
+}
+
+function Send-HeatWaitSignal {
+    param(
+        [parameter(Mandatory=$true)]
+        [string]$Endpoint,
+        [parameter(Mandatory=$true)]
+        [string]$Token,
+        $Message,
+        $Success=$true
+    )
+
+    $statusMap = @{
+        $true="SUCCESS";
+        $false="FAILURE"
+    }
+
+    $heatMessage = @{
+        "status"=$statusMap[$Success];
+        "reason"="Configuration script has been executed.";
+        "data"=$Message;
+    }
+    $headers = @{
+        "X-Auth-Token"=$Token;
+        "Accept"="application/json";
+        "Content-Type"= "application/json";
+    }
+    $heatMessageJSON = $heatMessage | ConvertTo-JSON
+    $result = Invoke-RestMethod -Method POST -Uri $Endpoint `
+                -Body $heatMessageJSON -Headers $headers
+}
+
 Export-ModuleMember -Function *
