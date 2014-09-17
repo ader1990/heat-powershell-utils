@@ -155,6 +155,22 @@ function Unzip-File {
     $destinationNs.CopyHere($zipFileNs.Items(), 0x4)
 }
 
+function Unzip-FileWith7z {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$ZipFile,
+        [Parameter(Mandatory=$true)]
+        [string]$Destination,
+        [Parameter(Mandatory=$true)]
+        [string]$7zPath,
+    )
+
+    $res = Execute-Command -Command {
+        & $7zPath x "-o$Destination" $ZipFile
+    }
+    return $res
+}
+
 function Download-File {
     param(
         [Parameter(Mandatory=$true)]
@@ -316,13 +332,15 @@ function LogTo-File {
     )
 
     $date = Get-Date
-    $fullMessage = "$Date | $Topic | $LogMessage"
-    Add-Content -Path $logFile -Value $fullMessage
+    $fullMessage = "$date | $Topic | $LogMessage"
+    Add-Content -Path $LogFile -Value $fullMessage
 }
 
-function Open-Port($port, $protocol, $name) {
-    netsh.exe advfirewall firewall add rule name=$name dir=in action=allow `
-        protocol=$protocol localport=$port
+function Open-Port($Port, $Protocol, $Name) {
+    Execute-Command -Command {
+        netsh.exe advfirewall firewall add rule `
+            name=$Name dir=in action=allow protocol=$Protocol localport=$Port
+    }
 }
 
 Export-ModuleMember -Function *
