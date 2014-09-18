@@ -79,6 +79,15 @@ function Execute-Command {
     return $res
 }
 
+function Is-WindowsServer2008R2 () {
+    $winVer = (Get-WmiObject -class Win32_OperatingSystem).Version.Split('.')
+    return (($winVer[0] -eq 6) -and ($winVer[1] -eq 1))
+}
+
+function Get-PSMajorVersion () {
+    return $PSVersionTable.PSVersion.Major
+}
+
 function Install-WindowsFeatures {
      param(
         [Parameter(Mandatory=$true)]
@@ -86,15 +95,13 @@ function Install-WindowsFeatures {
         [int]$RebootCode=$rebootAndReexecuteCode
     )
 
-    $winVer = (Get-WmiObject -class Win32_OperatingSystem).Version.Split('.')
-    $isWinServer2008R2 = (($winVer[0] -eq 6) -and ($winVer[1] -eq 1))
-    if ($isWinServer2008R2 -eq $true) {
+    if ((Is-WindowsServer2008R2) -eq $true) {
         Import-Module ServerManager
     }
 
     $rebootNeeded = $false
     foreach ($feature in $Features) {
-        if ($isWinServer2008R2 -eq $true) {
+        if ((Is-WindowsServer2008R2) -eq $true) {
             $state = ExecuteWith-Retry -Command {
                 Add-WindowsFeature -Name $feature -ErrorAction Stop
             }
@@ -215,14 +222,15 @@ function Check-FileIntegrityWithSHA1 {
         [string]$ExpectedSHA1Hash
     )
 
-    if ($PSVersionTable.PSVersion.Major -lt 4) {
+    if ((Get-PSMajorVersion) -lt 4) {
         $hash = (Get-FileSHA1Hash -Path $File).Hash
     } else {
         $hash = (Get-FileHash -Path $File -Algorithm "SHA1").Hash
     }
     if ($hash -ne $ExpectedSHA1Hash) {
-        throw ("SHA1 hash not valid for file: $filename. " +
-               "Expected: $ExpectedSHA1Hash Current: $hash")
+        $errMsg = "SHA1 hash not valid for file: $filename. " +
+                  "Expected: $ExpectedSHA1Hash Current: $hash"
+        throw $errMsg
     }
 }
 
@@ -312,12 +320,12 @@ function LogTo-File {
     param(
         $LogMessage,
         $LogFile="C:\cfn\userdata.log",
-        $Topic="general"
+        $Topic="General"
     )
 
     $date = Get-Date
-    $fullMessage = "$Date | $Topic | $LogMessage"
-    Add-Content -Path $logFile -Value $fullMessage
+    $fullMessage = "$date | $Topic | $LogMessage"
+    Add-Content -Path $LogFile -Value $fullMessage
 }
 
 function Open-Port($port, $protocol, $name) {
@@ -334,6 +342,62 @@ function Add-WindowsUser {
     )
 
     NET.EXE USER $Username $Password '/ADD'
+}
+
+# Invoke-RestMethod for Powershell versions less than 3.0
+function Invoke-RestMethodWrapper {
+    param(
+        [Uri]$Uri,
+        [Object]$Body,
+        [System.Collections.IDictionary]$Headers,
+        [Microsoft.PowerShell.Commands.WebRequestMethod]$Method
+    )
+
+    $request = [System.Net.WebRequest]::Create($Uri)
+    $request.Method = $Method
+    foreach ($key in $Headers.Keys) {
+        try {
+            $request.Headers.Add($key, $Headers[$key])
+        } catch {
+            $property = $key.Replace('-', '')
+            $request.$property = $Headers[$key]
+        }
+    }
+
+    if (($Body -ne $null) -and ($Method -eq "POST")) {
+        $encoding = [System.Text.Encoding]::GetEncoding("iso-8859-1")
+        $bytes = $encoding.GetBytes($Body)
+        $request.ContentLength = $bytes.Length
+        $writeStream = $request.GetRequestStream()
+        $writeStream.Write($bytes, 0, $bytes.Length)
+    }
+
+    $response = $request.GetResponse()
+    $requestStream = $response.GetResponseStream()
+    $readStream = New-Object System.IO.StreamReader $requestStream
+    $data = $readStream.ReadToEnd()
+
+    return $data
+}
+
+function Invoke-HeatRestMethod {
+    param(
+        [Uri]$Endpoint,
+        [System.String]$HeatMessageJSON,
+        [System.Collections.IDictionary]$Headers
+    )
+
+    if ((Get-PSMajorVersion) -lt 3) {
+        $result = Invoke-RestMethodWrapper -Method "POST"
+                                           -Uri $Endpoint `
+                                           -Body $HeatMessageJSON `
+                                           -Headers $Headers
+    } else {
+        $result = Invoke-RestMethod -Method "POST" `
+                                    -Uri $Endpoint `
+                                    -Body $HeatMessageJSON `
+                                    -Headers $Headers
+    }
 }
 
 function Send-HeatWaitSignal {
@@ -361,9 +425,11 @@ function Send-HeatWaitSignal {
         "Accept"="application/json";
         "Content-Type"= "application/json";
     }
-    $heatMessageJSON = $heatMessage | ConvertTo-JSON
-    $result = Invoke-RestMethod -Method POST -Uri $Endpoint `
-                -Body $heatMessageJSON -Headers $headers
+    $heatMessageJSON = ConvertTo-JSON -InputObject $heatMessage
+
+    Invoke-HeatRestMethod -Endpoint $Endpoint `
+                          -HeatMessageJSON $heatMessageJSON `
+                          -Headers $headers
 }
 
 Export-ModuleMember -Function *
