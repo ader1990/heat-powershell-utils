@@ -18,13 +18,7 @@ $rebotCode = 1001
 $reexecuteCode = 1002
 $rebootAndReexecuteCode = 1003
 
-function Log-HeatMessage {
-    param(
-        [string]$Message
-    )
-
-    Write-Host $Message
-}
+# UNTESTABLE METHODS
 
 function ExitFrom-Script {
     param(
@@ -32,6 +26,60 @@ function ExitFrom-Script {
     )
 
     exit $ExitCode
+}
+
+function Get-LastExitCode () {
+    return $LASTEXITCODE
+}
+
+function Get-PSMajorVersion () {
+    return $PSVersionTable.PSVersion.Major
+}
+
+function Open-FileForRead ($FilePath) {
+    return [System.IO.File]::OpenRead($FilePath)
+}
+
+function Write-PrivateProfileString ($Section, $Key, $Value, $Path) {
+    return [PSCloudbase.Win32IniApi]::WritePrivateProfileString(
+                                            $Section, $Key, $Value, $Path)
+}
+
+function Get-LastError () {
+    return [PSCloudbase.Win32IniApi]::GetLastError()
+}
+
+function Create-WebRequest ($Uri) {
+    return [System.Net.WebRequest]::Create($Uri)
+}
+
+function Get-Encoding ($CodePage) {
+    return [System.Text.Encoding]::GetEncoding($CodePage)
+}
+
+function Execute-Process ($DestinationFile, $Arguments) {
+    if (($Arguments.Count -eq 0) -or ($Arguments -eq $null)) {
+        $p = Start-Process -FilePath $DestinationFile `
+                           -PassThru `
+                           -Wait
+    } else {
+        $p = Start-Process -FilePath $DestinationFile `
+                           -ArgumentList $Arguments `
+                           -PassThru `
+                           -Wait
+    }
+
+    return $p
+}
+
+# TESTABLE METHODS
+
+function Log-HeatMessage {
+    param(
+        [string]$Message
+    )
+
+    Write-Host $Message
 }
 
 function ExecuteWith-Retry {
@@ -65,7 +113,7 @@ function ExecuteWith-Retry {
     }
 }
 
-function Execute-Command {
+function Execute-ExternalCommand {
     param(
         [ScriptBlock]$Command,
         [array]$Arguments=@(),
@@ -73,19 +121,15 @@ function Execute-Command {
     )
 
     $res = Invoke-Command -ScriptBlock $Command -ArgumentList $Arguments
-    if ($LASTEXITCODE -ne 0) {
+    if ((Get-LastExitCode) -ne 0) {
         throw $ErrorMessage
     }
     return $res
 }
 
 function Is-WindowsServer2008R2 () {
-    $winVer = (Get-WmiObject -class Win32_OperatingSystem).Version.Split('.')
+    $winVer = (Get-WmiObject -Class Win32_OperatingSystem).Version.Split('.')
     return (($winVer[0] -eq 6) -and ($winVer[1] -eq 1))
-}
-
-function Get-PSMajorVersion () {
-    return $PSVersionTable.PSVersion.Major
 }
 
 function Install-WindowsFeatures {
@@ -96,7 +140,7 @@ function Install-WindowsFeatures {
     )
 
     if ((Is-WindowsServer2008R2) -eq $true) {
-        Import-Module ServerManager
+        Import-Module -Name ServerManager
     }
 
     $rebootNeeded = $false
@@ -104,11 +148,11 @@ function Install-WindowsFeatures {
         if ((Is-WindowsServer2008R2) -eq $true) {
             $state = ExecuteWith-Retry -Command {
                 Add-WindowsFeature -Name $feature -ErrorAction Stop
-            }
+            } -MaxRetryCount 13 -RetryInterval 2
         } else {
             $state = ExecuteWith-Retry -Command {
                 Install-WindowsFeature -Name $feature -ErrorAction Stop
-            }
+            } -MaxRetryCount 13 -RetryInterval 2
         }
         if ($state.Success -eq $true) {
             if ($state.RestartNeeded -eq 'Yes') {
@@ -120,32 +164,23 @@ function Install-WindowsFeatures {
     }
 
     if ($rebootNeeded -eq $true) {
-        ExitFrom-Script $RebootCode
+        ExitFrom-Script -ExitCode $RebootCode
     }
 }
 
-function CopyFrom-SambaShare {
+function Copy-FileToLocal {
     param(
-        [Parameter(Mandatory=$true)]
-        [string]$SambaDrive,
-        [Parameter(Mandatory=$true)]
-        [string]$SambaShare,
-        [Parameter(Mandatory=$true)]
-        [string]$SambaFolder,
-        [Parameter(Mandatory=$true)]
-        [string]$FileName,
-        [Parameter(Mandatory=$true)]
-        [string]$Destination
+        $UNCPath
     )
 
-    $p = New-PSDrive -Name $SambaDrive -Root $SambaShare -PSProvider FileSystem
-    $samba = ($SambaDrive + ":\\" + $SambaFolder)
-    $localPath = "$Destination\$FileName"
-    if (!(Test-Path $localPath)) {
-        Copy-Item "$samba\$FileName" $Destination -Recurse
-    }
-    return $localPath
+    $tempLocation = ${ENV:Temp}
+    $fileName = Split-Path -Path $UNCPath -Leaf
+    $localPath = Join-Path -Path $tempLocation -ChildPath $fileName
+    Copy-Item -Path $UNCPath -Destination $localPath -Recurse -Force
 
+    Log-HeatMessage ("Local file path: " + $localPath)
+
+    return $localPath
 }
 
 function Unzip-File {
@@ -158,8 +193,8 @@ function Unzip-File {
 
     $shellApp = New-Object -ComObject Shell.Application
     $zipFileNs = $shellApp.NameSpace($ZipFile)
-    $destinationNs = $shellApp.NameSpace($Destination)
-    $destinationNs.CopyHere($zipFileNs.Items(), 0x4)
+    $destinationNS = $shellApp.NameSpace($Destination)
+    $destinationNS.CopyHere($zipFileNs.Items(), 0x4)
 }
 
 function Download-File {
@@ -173,7 +208,7 @@ function Download-File {
     $webclient = New-Object System.Net.WebClient
     ExecuteWith-Retry -Command {
         $webclient.DownloadFile($DownloadLink, $DestinationFile)
-    }
+    } -MaxRetryCount 13 -RetryInterval 2
 }
 
 # Get-FileHash for Powershell versions less than 4.0 (SHA1 algorithm only)
@@ -191,7 +226,7 @@ function Get-FileSHA1Hash {
             throw "Unsupported algorithm: $Algorithm"
         }
         $fullPath = Resolve-Path $Path
-        $f = [System.IO.File]::OpenRead($fullPath)
+        $f = Open-FileForRead $fullPath
         $sham = $null
         try {
             $sham = New-Object System.Security.Cryptography.SHA1Managed
@@ -201,9 +236,9 @@ function Get-FileSHA1Hash {
             foreach ($b in $hash) {
                 $sb = $hashSB.AppendFormat("{0:x2}", $b)
             }
-            return [PSCustomObject]@{ Algorithm="SHA1";
-                                      Hash=$hashSB.ToString().ToUpper();
-                                      Path=$fullPath }
+            return [PSCustomObject]@{ Algorithm = "SHA1";
+                                      Hash = $hashSB.ToString().ToUpper();
+                                      Path = $fullPath }
         }
         finally {
             $f.Close()
@@ -242,19 +277,15 @@ function Install-Program {
         [string]$DestinationFile,
         [Parameter(Mandatory=$true)]
         [string]$ExpectedSHA1Hash,
-        [Parameter(Mandatory=$true)]
-        [string]$Arguments,
+        [array]$Arguments,
         [Parameter(Mandatory=$true)]
         [string]$ErrorMessage
     )
 
     Download-File $DownloadLink $DestinationFile
     Check-FileIntegrityWithSHA1 $DestinationFile $ExpectedSHA1Hash
+    $p = Execute-Process $DestinationFile $Arguments
 
-    $p = Start-Process -FilePath $DestinationFile `
-                       -ArgumentList $Arguments `
-                       -PassThru `
-                       -Wait
     if ($p.ExitCode -ne 0) {
         throw $ErrorMessage
     }
@@ -309,9 +340,10 @@ function Set-IniFileValue {
         }
 "@
         Add-Type -TypeDefinition $Source -Language CSharp
-        $retVal = [PSCloudbase.Win32IniApi]::WritePrivateProfileString($Section, $Key, $Value, $Path)
-        if (!$retVal -and [PSCloudbase.Win32IniApi]::GetLastError()) {
-            throw "Cannot set value in ini file: " + [PSCloudbase.Win32IniApi]::GetLastError()
+        $retVal = Write-PrivateProfileString $Section $Key $Value $Path
+        $lastError = Get-LastError
+        if (!$retVal -and $lastError) {
+            throw ("Cannot set value in ini file: " + $lastError)
         }
     }
 }
@@ -319,8 +351,8 @@ function Set-IniFileValue {
 function LogTo-File {
     param(
         $LogMessage,
-        $LogFile="C:\cfn\userdata.log",
-        $Topic="General"
+        $LogFile = "C:\cfn\userdata.log",
+        $Topic = "General"
     )
 
     $date = Get-Date
@@ -328,9 +360,11 @@ function LogTo-File {
     Add-Content -Path $LogFile -Value $fullMessage
 }
 
-function Open-Port($port, $protocol, $name) {
-    netsh.exe advfirewall firewall add rule name=$name dir=in action=allow `
-        protocol=$protocol localport=$port
+function Open-Port($Port, $Protocol, $Name) {
+    Execute-ExternalCommand -Command {
+        netsh.exe advfirewall firewall add rule `
+            name=$Name dir=in action=allow protocol=$Protocol localport=$Port
+    } -ErrorMessage "Failed to add firewall rule"
 }
 
 function Add-WindowsUser {
@@ -341,19 +375,21 @@ function Add-WindowsUser {
         [string]$Password
     )
 
-    NET.EXE USER $Username $Password '/ADD'
+    Execute-ExternalCommand -Command {
+        NET.EXE USER $Username $Password '/ADD'
+    } -ErrorMessage "Failed to create new user"
 }
 
-# Invoke-RestMethod for Powershell versions less than 3.0
+# Invoke-RestMethod for Powershell versions less than 4.0
 function Invoke-RestMethodWrapper {
     param(
         [Uri]$Uri,
         [Object]$Body,
         [System.Collections.IDictionary]$Headers,
-        [Microsoft.PowerShell.Commands.WebRequestMethod]$Method
+        [string]$Method
     )
 
-    $request = [System.Net.WebRequest]::Create($Uri)
+    $request = Create-WebRequest $Uri
     $request.Method = $Method
     foreach ($key in $Headers.Keys) {
         try {
@@ -365,7 +401,7 @@ function Invoke-RestMethodWrapper {
     }
 
     if (($Body -ne $null) -and ($Method -eq "POST")) {
-        $encoding = [System.Text.Encoding]::GetEncoding("iso-8859-1")
+        $encoding = Get-Encoding "UTF-8"
         $bytes = $encoding.GetBytes($Body)
         $request.ContentLength = $bytes.Length
         $writeStream = $request.GetRequestStream()
@@ -382,13 +418,13 @@ function Invoke-RestMethodWrapper {
 
 function Invoke-HeatRestMethod {
     param(
-        [Uri]$Endpoint,
+        $Endpoint,
         [System.String]$HeatMessageJSON,
         [System.Collections.IDictionary]$Headers
     )
 
-    if ((Get-PSMajorVersion) -lt 3) {
-        $result = Invoke-RestMethodWrapper -Method "POST"
+    if ((Get-PSMajorVersion) -lt 4) {
+        $result = Invoke-RestMethodWrapper -Method "POST" `
                                            -Uri $Endpoint `
                                            -Body $HeatMessageJSON `
                                            -Headers $Headers
